@@ -11,7 +11,7 @@ import { MapPin, Users, BedDouble, Bath, Ruler, Calendar, Mail, Phone, ExternalL
 const PROPERTIES = [
   {
     id: "A",
-    title: "Propriété A — Rincon de la Victoria",
+    title: "Villa familiale les pieds dans l’eau — Rincon de la Victoria",
     location: "Espagne, Andalousie",
     capacity: 6,
     bedrooms: 3,

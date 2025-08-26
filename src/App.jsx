@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { MapPin, Users, BedDouble, Bath, Ruler, Calendar, Mail, Phone, ExternalLink } from "lucide-react";
+import { MapPin, Users, BedDouble, Bath, Ruler, Calendar, Mail, Phone, ExternalLink, CalendarDays } from "lucide-react";
 
 /**
- * ⚡ Mini-site vitrine pour 2 propriétés (version brouillon)
- * - Ajout des URLs iCal Airbnb pour afficher les dispos
- * - Adresse de contact mise à jour vers jf@fitamant.fr
+ * ⚡ Mini-site vitrine pour 2 propriétés (avec calendrier iCal + formulaire)
+ * - Calendrier iCal Airbnb (lecture seule) + retry auto via proxy Vercel pour CORS
+ * - Formulaire “Demander une réservation” (mailto → jf@fitamant.fr) par propriété
  */
 
 const PROPERTIES = [
@@ -181,6 +181,16 @@ function PropertySection({ property, flip = false }) {
             </li>
           ))}
         </ul>
+
+        {/* Disponibilités (iCal Airbnb) */}
+        <div className="pt-2">
+          <h4 className="font-semibold mb-2 flex items-center gap-2"><CalendarDays size={18}/>Disponibilités</h4>
+          <AvailabilityCalendar icalUrl={property.icalUrl} />
+        </div>
+
+        {/* Demande de réservation (email) */}
+        <RequestForm property={property} />
+
         <div className="flex gap-3 pt-2">
           <a
             href={property.bookingUrl}
@@ -204,6 +214,218 @@ function Badge({ children, icon }) {
     </span>
   );
 }
+
+/** ================ CALENDRIER ICAL ================ */
+
+function AvailabilityCalendar({ icalUrl }) {
+  const [current, setCurrent] = useState(() => new Date());
+  const [busyDates, setBusyDates] = useState(() => new Set());
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let ignore = false;
+    async function fetchICS(url, triedProxy = false) {
+      setError("");
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        const ranges = parseICS(text);
+        if (ignore) return;
+        const dates = new Set();
+        ranges.forEach(([start, end]) => {
+          const d = new Date(start);
+          while (d < end) {
+            dates.add(ymd(d));
+            d.setDate(d.getDate() + 1);
+          }
+        });
+        setBusyDates(dates);
+      } catch (e) {
+        // Si CORS en direct, retente via proxy Vercel
+        if (!triedProxy) {
+          const proxied = `/api/ics-proxy?url=${encodeURIComponent(icalUrl)}`;
+          fetchICS(proxied, true);
+          return;
+        }
+        setError("Calendrier indisponible. Si le problème persiste, vérifiez le proxy iCal.");
+      }
+    }
+    if (icalUrl) fetchICS(icalUrl);
+    return () => { ignore = true; };
+  }, [icalUrl]);
+
+  const days = useMemo(() => buildMonthDays(current), [current]);
+
+  return (
+    <div className="border border-zinc-200 rounded-2xl overflow-hidden bg-white">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-200">
+        <button className="px-3 py-1 rounded-lg border" onClick={() => setCurrent(addMonths(current, -1))}>←</button>
+        <div className="font-medium">{formatMonth(current)}</div>
+        <button className="px-3 py-1 rounded-lg border" onClick={() => setCurrent(addMonths(current, 1))}>→</button>
+      </div>
+      <div className="grid grid-cols-7 text-xs text-zinc-500 px-3 pt-3">
+        {["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"].map((d) => (
+          <div key={d} className="text-center pb-2">{d}</div>
+        ))}
+      </div>
+      <div className="grid grid-cols-7 gap-1 p-3">
+        {days.map((d, i) => {
+          const key = ymd(d.date);
+          const isOtherMonth = d.isOtherMonth;
+          const isPast = d.date < stripTime(new Date());
+          const isBusy = busyDates.has(key);
+          return (
+            <div
+              key={i}
+              className={[
+                "h-10 rounded-lg flex items-center justify-center text-sm border",
+                isOtherMonth ? "text-zinc-300 border-zinc-100 bg-zinc-50" : "",
+                !isOtherMonth && isBusy ? "bg-red-100/70 border-red-200 text-red-700" : "",
+                !isOtherMonth && !isBusy ? "bg-white border-zinc-200" : "",
+                isPast ? "opacity-60" : ""
+              ].join(" ")}
+              title={isBusy ? "Indisponible" : "Disponible"}
+            >
+              {d.date.getDate()}
+            </div>
+          );
+        })}
+      </div>
+      {error && <p className="px-4 pb-3 text-sm text-amber-700">{error}</p>}
+      <div className="px-4 pb-4 text-xs text-zinc-500">Source : iCal Airbnb (lecture seule).</div>
+    </div>
+  );
+}
+
+// Parse minimaliste du format ICS pour extraire des paires [start, end]
+function parseICS(text) {
+  const lines = text.split(/\r?\n/);
+  const events = [];
+  let current = {};
+  for (const line of lines) {
+    if (line.startsWith("BEGIN:VEVENT")) current = {};
+    if (line.startsWith("DTSTART")) current.start = parseICSTime(line);
+    if (line.startsWith("DTEND")) current.end = parseICSTime(line);
+    if (line.startsWith("END:VEVENT") && current.start && current.end) {
+      events.push([current.start, current.end]);
+      current = {};
+    }
+  }
+  return events;
+}
+
+function parseICSTime(line) {
+  // Exemples: DTSTART;VALUE=DATE:20250115  /  DTSTART:20250115T120000Z
+  const [, value] = line.split(":");
+  if (!value) return null;
+  if (/^\d{8}$/.test(value)) {
+    const y = +value.slice(0, 4), m = +value.slice(4, 6) - 1, d = +value.slice(6, 8);
+    return new Date(Date.UTC(y, m, d));
+  }
+  // YYYYMMDDTHHmmssZ
+  const y = +value.slice(0, 4), m = +value.slice(4, 6) - 1, d = +value.slice(6, 8);
+  const hh = +value.slice(9, 11) || 0, mm = +value.slice(11, 13) || 0, ss = +value.slice(13, 15) || 0;
+  return new Date(Date.UTC(y, m, d, hh, mm, ss));
+}
+
+function buildMonthDays(anchor) {
+  const first = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+  const firstWeekday = (first.getDay() + 6) % 7; // Lundi=0
+  const start = new Date(first);
+  start.setDate(first.getDate() - firstWeekday);
+  const days = [];
+  for (let i = 0; i < 42; i++) {
+    const date = new Date(start);
+    date.setDate(start.getDate() + i);
+    days.push({ date, isOtherMonth: date.getMonth() !== anchor.getMonth() });
+  }
+  return days;
+}
+
+function addMonths(date, count) {
+  const d = new Date(date);
+  d.setMonth(d.getMonth() + count);
+  return d;
+}
+
+function stripTime(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function ymd(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function formatMonth(d) {
+  return d.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
+}
+
+/** ================ FORMULAIRE PAR PROPRIÉTÉ ================ */
+
+function RequestForm({ property }) {
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [guests, setGuests] = useState(2);
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const [message, setMessage] = useState("");
+
+  const valid = firstName && email && start && end;
+  const body = `Bonjour,\n\nJe souhaite une réservation pour ${property.title}.\nDates souhaitées: ${start} → ${end}\nVoyageurs: ${guests}\nNom: ${firstName} ${lastName}\nTéléphone: ${phone}\n\nMessage: ${message}\n`;
+  const mailto = `mailto:jf@fitamant.fr?subject=${encodeURIComponent("Demande de réservation — " + property.title)}&body=${encodeURIComponent(body)}`;
+
+  return (
+    <div className="bg-white border border-zinc-200 rounded-2xl p-5 shadow-sm space-y-3">
+      <h4 className="text-base font-semibold">Demander une réservation</h4>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className="block text-sm font-medium">Prénom *</label>
+          <input value={firstName} onChange={(e) => setFirstName(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" placeholder="Votre prénom" />
+        </div>
+        <div>
+          <label className="block text-sm font-medium">Nom</label>
+          <input value={lastName} onChange={(e) => setLastName(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" placeholder="Votre nom" />
+        </div>
+        <div>
+          <label className="block text-sm font-medium">Email *</label>
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" placeholder="vous@exemple.fr" />
+        </div>
+        <div>
+          <label className="block text-sm font-medium">Téléphone</label>
+          <input value={phone} onChange={(e) => setPhone(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" placeholder="+33…" />
+        </div>
+        <div>
+          <label className="block text-sm font-medium">Arrivée *</label>
+          <input type="date" value={start} onChange={(e) => setStart(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" />
+        </div>
+        <div>
+          <label className="block text-sm font-medium">Départ *</label>
+          <input type="date" value={end} onChange={(e) => setEnd(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" />
+        </div>
+        <div>
+          <label className="block text-sm font-medium">Voyageurs</label>
+          <input type="number" min={1} max={16} value={guests} onChange={(e) => setGuests(+e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" />
+        </div>
+        <div className="sm:col-span-2">
+          <label className="block text-sm font-medium">Message</label>
+          <textarea rows={3} value={message} onChange={(e) => setMessage(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2" placeholder="Précisions: enfants, animaux, heures d'arrivée…" />
+        </div>
+      </div>
+      <div className="flex gap-3">
+        <a href={mailto} className={`px-5 py-3 rounded-xl text-white shadow ${valid ? "bg-zinc-900 hover:opacity-90" : "bg-zinc-400 cursor-not-allowed"}`}>Envoyer la demande</a>
+        <span className="text-xs text-zinc-500 self-center">* champs obligatoires</span>
+      </div>
+    </div>
+  );
+}
+
+/** ================ SECTIONS RESTANTES ================ */
 
 function PracticalInfo() {
   return (
